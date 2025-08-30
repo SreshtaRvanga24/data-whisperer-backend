@@ -6,7 +6,7 @@ import requests
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date as date_cls
 import sys
 import logging
 import warnings
@@ -41,12 +41,15 @@ def nullify(value):
     return None if s.lower() in NULL_STRINGS else (s if s != "" else None)
 
 def nullify_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply nullify() to object/string columns; preserve numeric/boolean types."""
+    """
+    Apply nullify() to object/string columns only; DO NOT blanket-replace across the frame,
+    so datetime64 columns keep NaT (avoids int epoch issues later).
+    """
     out = df.copy()
     for col in out.columns:
         if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
             out[col] = out[col].map(nullify)
-    return out.where(pd.notnull(out), None)
+    return out
 
 def strip_strings_inplace(df: pd.DataFrame) -> pd.DataFrame:
     """Trim whitespace for string-like columns without forcing type conversion."""
@@ -194,6 +197,95 @@ def to_nullable_int(series: pd.Series) -> pd.Series:
     return s.astype("Int64")
 
 # ==============================
+# TEMPORAL COERCION
+# ==============================
+from pandas.api.types import is_datetime64_any_dtype, is_object_dtype
+
+DATE_ONLY_RX = re.compile(r"(?:^|_)(DATE|DOB|BIRTH|START_DATE|END_DATE|EFFECTIVE_DATE)(?:$|_)", re.I)
+DATETIME_RX  = re.compile(r"(?:_AT$|_TS$|TIMESTAMP|TIME$)", re.I)
+
+def coerce_temporal_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert obvious date/datetime columns from strings so write_pandas
+    creates TIMESTAMP_NTZ/DATE columns in Snowflake.
+    """
+    out = df.copy()
+    for col in out.columns:
+        u = col.upper()
+        if u == "LOAD_DATE":
+            out[col] = pd.to_datetime(out[col], errors="coerce")  # datetime64[ns]
+            continue
+        if DATETIME_RX.search(u):
+            out[col] = pd.to_datetime(out[col], errors="coerce")  # datetime64[ns]
+            continue
+        if DATE_ONLY_RX.search(u):
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.date  # Python date -> Snowflake DATE
+            continue
+    return out
+
+def nullify_non_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace missing values with None ONLY for object/string columns.
+    Keep datetime columns as NaT so Arrow/Snowflake map them to TIMESTAMP/DATE.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if is_datetime64_any_dtype(out[col]):
+            continue  # keep NaT
+        if is_object_dtype(out[col]):
+            out[col] = out[col].where(pd.notnull(out[col]), None)
+    return out
+
+# ==============================
+# SCHEMA CONTROL FOR CLEANSED (NEW)
+# ==============================
+def is_date_object_series(s: pd.Series) -> bool:
+    if s.dtype != 'object':
+        return False
+    for v in s.dropna().head(20):
+        if isinstance(v, date_cls):
+            return True
+        # if you accidentally have datetime objects in object dtype
+        if isinstance(v, datetime):
+            return True
+    return False
+
+def sf_type_for_column(name: str, s: pd.Series) -> str:
+    u = name.upper()
+    if u == "LOAD_DATE":
+        return "TIMESTAMP_NTZ(9)"
+    # pandas datetime64 -> TIMESTAMP_NTZ
+    if is_datetime64_any_dtype(s):
+        return "TIMESTAMP_NTZ(9)"
+    # Python date/datetime objects stored in object dtype -> DATE or TIMESTAMP
+    if is_date_object_series(s):
+        # if any pure date objects, DATE; if any datetime, timestamp (handled above)
+        # here it's OK to return DATE; TIMESTAMP comes via datetime64 branch
+        # choose DATE for date-only columns
+        # (we coerced *_DATE to .dt.date, so object-of-date -> DATE)
+        return "DATE"
+    if pd.api.types.is_bool_dtype(s):
+        return "BOOLEAN"
+    # pandas nullable int
+    if str(s.dtype) == "Int64" or pd.api.types.is_integer_dtype(s):
+        return "NUMBER(38,0)"
+    if pd.api.types.is_float_dtype(s):
+        return "FLOAT"
+    # default
+    return "VARCHAR"
+
+def create_or_replace_cleansed_table(conn, database: str, schema: str, table: str, df: pd.DataFrame):
+    cols = []
+    for col in df.columns:
+        cols.append(f'"{col}" {sf_type_for_column(col, df[col])}')
+    ddl = f'CREATE OR REPLACE TABLE "{database}"."{schema}"."{table}" ({", ".join(cols)})'
+    cur = conn.cursor()
+    try:
+        cur.execute(ddl)
+    finally:
+        cur.close()
+
+# ==============================
 # CORE ETL FUNCTIONS
 # ==============================
 def read_sources(excel_file):
@@ -245,7 +337,7 @@ def process_dataframe_for_load(df):
     """Minimal processing before STAGE load."""
     out = df.copy()
     out = strip_strings_inplace(out)
-    out = nullify_frame(out)
+    out = nullify_frame(out)  # now only touches object/string columns
     return out
 
 def load_to_snowflake(dataframes):
@@ -319,9 +411,6 @@ def load_to_snowflake(dataframes):
         # Part 2: Transform STAGE -> CLEANSED
         # Only latest batch per table using TO_TIMESTAMP_NTZ(LOAD_DATE)
         # -----------------------------
-        print("\n" + "="*50)
-        print("PROCESSING LATEST BATCH FROM STAGE TO CLEANSED")
-        print("="*50)
 
         cursor.execute("SHOW TABLES IN HACK.STAGE")
         tables = [row[1] for row in cursor.fetchall()]
@@ -340,15 +429,11 @@ def load_to_snowflake(dataframes):
                 all_columns = [row[0] for row in table_desc]
                 print(f"All columns in {t}: {all_columns}")
 
-                # Cast LOAD_DATE to TIMESTAMP_NTZ on read; filter to latest batch
-                cast_cols = []
-                for c in all_columns:
-                    if c == "LOAD_DATE":
-                        cast_cols.append('TO_TIMESTAMP_NTZ("LOAD_DATE") AS "LOAD_DATE"')
-                    else:
-                        cast_cols.append(f'"{c}"')
-                select_cols = ', '.join(cast_cols)
+                # Build SELECT column list EXCLUDING LOAD_DATE
+                select_cols_list = [f'"{c}"' for c in all_columns if c != "LOAD_DATE"]
+                select_cols = ", ".join(select_cols_list) if select_cols_list else "*"
 
+                # Use LOAD_DATE only for filtering latest batch if it exists
                 if "LOAD_DATE" in all_columns:
                     select_stmt = (
                         f'SELECT {select_cols} '
@@ -360,7 +445,7 @@ def load_to_snowflake(dataframes):
                 else:
                     select_stmt = f'SELECT {select_cols} FROM "HACK"."STAGE"."{t}"'
 
-                print(f"Fetching latest-batch records from STAGE.{t}...")
+                print(f"Fetching latest-batch records (without LOAD_DATE) from STAGE.{t}...")
                 cursor.execute(select_stmt)
                 rows = cursor.fetchall()
 
@@ -371,24 +456,22 @@ def load_to_snowflake(dataframes):
                     print(f"No records in latest batch for {t}, skipping...")
                     continue
 
-                # Clean & transform
+                # Clean & transform (LOAD_DATE is not present in df anymore)
                 print("Cleaning data...")
                 df = strip_strings_inplace(df)
-                df = nullify_frame(df)
-
+                df = nullify_frame(df)            # touches only object/string
+                df = coerce_temporal_columns(df)  # safe even if LOAD_DATE is absent
                 t_upper = t.upper()
 
                 # DIM_CUSTOMERS: phone normalization
                 if t_upper == "DIM_CUSTOMERS":
                     df = add_phone_columns(df, phone_col="PHONE")
-                    # Optional strict filter:
-                    # df = df[(df["PHONE_VALID"] == True) | df["PHONE"].isna()]
 
                 # LOYALTY_LEDGER: TXN_ID -> nullable integer
                 if t_upper == "LOYALTY_LEDGER" and "TXN_ID" in df.columns:
                     df["TXN_ID"] = to_nullable_int(df["TXN_ID"])
 
-                # Big-int safeguard for all other cols
+                # Big-int safeguard for string columns
                 df = safeguard_bigints(df)
 
                 # Deduplicate
@@ -399,23 +482,29 @@ def load_to_snowflake(dataframes):
                 if before != after:
                     print(f"Deduplicated - removed {before - after} duplicate rows")
 
-                # Ensure proper NULLs just before load
-                df = df.where(pd.notnull(df), None)
+                # Preserve datetime dtypes; only set None on object columns
+                df = nullify_non_datetime(df)
 
-                # Write to CLEANSED (auto create with inferred types)
-                target_table_name = t_upper
-                print(f"Writing {len(df)} rows to CLEANSED.{target_table_name}...")
+                # (Re)create CLEANSED table WITHOUT LOAD_DATE (since df has no LOAD_DATE)
+                print("Creating CLEANSED table with explicit types (no LOAD_DATE)...")
+                create_or_replace_cleansed_table(
+                    conn, database="HACK", schema="CLEANSED",
+                    table=t_upper, df=df
+                )
+
+                # Load to CLEANSED (no auto-create; schema already correct)
+                print(f"Writing {len(df)} rows to CLEANSED.{t_upper}...")
                 write_pandas(
                     conn,
                     df,
-                    table_name=target_table_name,
+                    table_name=t_upper,
                     database="HACK",
                     schema="CLEANSED",
-                    auto_create_table=True,
-                    overwrite=True,           # overwrite with latest batch snapshot
+                    auto_create_table=False,    # we're controlling schema
+                    overwrite=False,            # table just got replaced above
                     quote_identifiers=True
                 )
-                print(f"SUCCESS: Wrote {len(df)} rows into HACK.CLEANSED.{target_table_name}")
+                print(f"SUCCESS: Wrote {len(df)} rows into HACK.CLEANSED.{t_upper}")
 
             except Exception as e:
                 print(f"ERROR processing table {t}: {e}")

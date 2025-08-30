@@ -1,0 +1,96 @@
+# -------------------------
+# Node / Express
+# -------------------------
+node_modules/
+dist/
+build/
+.tmp/
+temp/
+tmp/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+debug.log
+
+# Runtime/PM2
+.pids
+*.pid
+*.seed
+*.pid.lock
+
+# TypeScript
+*.tsbuildinfo
+
+# Lint/coverage
+.eslintcache
+.nyc_output/
+coverage/
+
+# -------------------------
+# App-specific generated dirs
+# -------------------------
+uploads/
+dashboards/
+saved_dashboards/
+
+# -------------------------
+# Environment / secrets
+# -------------------------
+.env
+.env.*
+!.env.example            # keep a sample env in repo
+
+# -------------------------
+# Python (ETL helpers)
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.so
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints
+.venv/
+venv/
+env/
+
+# -------------------------
+# OS / Editor junk
+# -------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors/IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json  # keep recommended extensions if you want
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# -------------------------
+# Package managers (keep lockfiles!)
+# -------------------------
+# DO NOT ignore lockfiles; commit them:
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
